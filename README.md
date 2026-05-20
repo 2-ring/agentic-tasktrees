@@ -41,6 +41,19 @@ Every new task spawns an **orchestrator agent** automatically. The orchestrator 
 
 You see the orchestrator with a 🎓 mortar-board icon at the top of each task. Sub-agents get a 🤖 robot icon. Click any of them to open their tmux session inside a VSCode terminal — fully native, with the right title and color.
 
+### Persistent agent state (until you kill them)
+
+Agents are **not ephemeral**. Each one is recorded in `.worktrees/<task>/.agents` as `name|role|conversation-uuid` the moment it's created, and that file is the source of truth for "what should exist."
+
+This means:
+
+- **Reboot your machine** → the tmux sessions are gone, but every agent still appears in the sidebar with a `stopped` state. Click any of them and the extension runs `agent <id> resume`, which respawns the tmux session and reattaches Claude Code to the original conversation via `--resume <uuid>`. The agent picks up exactly where it left off — same memory, same context, same history.
+- **Restart VSCode** → no effect. The extension re-reads `.agents` on startup. Running agents stay running.
+- **Reload the extension** → no effect. Same.
+- **Quit Claude Code in a pane** → the agent shows as `stopped`. Click to resume.
+
+The only thing that ends an agent's life is an explicit **Kill Agent** or **Kill Task** click (or `agent <id> kill` from the CLI). Until then, your orchestrator and sub-agents are durable — you can leave a 50-message conversation running overnight, close your laptop, and find it intact in the morning.
+
 ### Live status with animated icons
 
 Each agent's icon reflects what it's doing right now, polled from `recon json`:
