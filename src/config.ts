@@ -86,6 +86,12 @@ export function getPollIntervalMs(): number {
     return 3000;
 }
 
+/** Whether to render the per-agent status text ("working", "awaiting input", …)
+ *  next to the agent name. Off by default — the icon already encodes status. */
+export function getShowStatusLabels(): boolean {
+    return section().get<boolean>('showStatusLabels') ?? false;
+}
+
 /**
  * Replace `${worktree}`, `${task}`, `${port}` (when supplied) in a string.
  * Unknown placeholders are left as-is so users notice typos.

@@ -48,6 +48,14 @@ export function activate(context: vscode.ExtensionContext) {
     // Refresh tree immediately on dev-state change so the play/stop icon swaps right away.
     context.subscriptions.push(onDevStateChanged(() => provider.refresh()));
 
+    // Repaint the tree when any of our settings change so e.g. toggling
+    // `showStatusLabels` updates instantly without needing a window reload.
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('agenticTaskTrees')) provider.refresh();
+        })
+    );
+
     // Drop dev-server terminal references when the user closes them.
     registerTerminalCloseHandler(context);
 
@@ -170,7 +178,7 @@ export function activate(context: vscode.ExtensionContext) {
                     cancellable: false,
                 },
                 async () => {
-                    await runDetached(getCliCommands().task, ['new', name, desc, '--no-attach']);
+                    await runCli(getCliCommands().task, ['new', name, desc, '--no-attach']);
                 }
             );
             // Kick off dep install immediately (npm / venv) in the background.
@@ -210,7 +218,7 @@ export function activate(context: vscode.ExtensionContext) {
                     cancellable: false,
                 },
                 async () => {
-                    await runDetached(getCliCommands().agent, ['new', '--task', task, name, role || 'agent', desc]);
+                    await runCli(getCliCommands().agent, ['new', '--task', task, name, role || 'agent', desc]);
                 }
             );
             provider.refresh();
@@ -327,11 +335,13 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('agentic-tasktrees.killTask', async (item?: TaskItem) => {
             const task = item?.task ?? (await pickTask());
             if (!task) return;
-            const c1 = await vscode.window.showWarningMessage(
-                `Kill all agents for task '${task}'? (Worktree stays — use Finish to merge & clean up.)`,
-                { modal: true },
-                'Kill'
-            );
+            const agents = provider.agentsForTask(task);
+            const summary = agents.length === 0
+                ? `Task '${task}' has no live agents tracked — proceed anyway?`
+                : `Kill all ${agents.length} agent(s) for task '${task}'?\n\n` +
+                  agents.map(a => `  • ${a}`).join('\n') +
+                  `\n\n(Worktree stays — use Finish to merge & clean up.)`;
+            const c1 = await vscode.window.showWarningMessage(summary, { modal: true }, 'Kill');
             if (c1 !== 'Kill') return;
             const c2 = await vscode.window.showWarningMessage(
                 `Are you sure you're sure?`,
@@ -339,9 +349,34 @@ export function activate(context: vscode.ExtensionContext) {
                 'Yes, kill'
             );
             if (c2 !== 'Yes, kill') return;
-            await runDetached(getCliCommands().task, [task, 'kill']);
-            provider.refresh();
-            vscode.window.showInformationMessage(`Killed agents for task '${task}'.`);
+
+            // Kill each agent directly. The `task <id> kill` script has a stale
+            // recon-tag filter and only catches sessions whose tmux name starts
+            // with `<task>-`, so sub-agents survive. Iterating `agent <id> kill`
+            // per cached snapshot entry is reliable and surfaces per-agent errors.
+            const cli = getCliCommands();
+            const results = await Promise.all(
+                agents.map(async a => ({ agent: a, code: await runCli(cli.agent, [a, 'kill']) }))
+            );
+            const failed = results.filter(r => r.code !== 0);
+            const succeeded = results.length - failed.length;
+
+            // Force an immediate poll so the tree reflects the kill without waiting
+            // for the next interval tick.
+            await provider.poll(true);
+
+            if (failed.length === 0) {
+                vscode.window.showInformationMessage(
+                    `Killed ${succeeded}/${results.length} agent(s) for task '${task}'.`
+                );
+            } else {
+                getCliChannel().show(true);
+                vscode.window.showWarningMessage(
+                    `Killed ${succeeded}/${results.length}; ${failed.length} failed: ` +
+                    failed.map(f => f.agent).join(', ') +
+                    `. See 'Agentic TaskTrees' output channel.`
+                );
+            }
         }),
 
         vscode.commands.registerCommand('agentic-tasktrees.killAgent', async (item?: AgentItem) => {
@@ -364,9 +399,16 @@ export function activate(context: vscode.ExtensionContext) {
                 'Yes, kill'
             );
             if (c2 !== 'Yes, kill') return;
-            await runDetached(getCliCommands().agent, [agent, 'kill']);
-            provider.refresh();
-            vscode.window.showInformationMessage(`Killed agent '${agent}'.`);
+            const code = await runCli(getCliCommands().agent, [agent, 'kill']);
+            await provider.poll(true);
+            if (code === 0) {
+                vscode.window.showInformationMessage(`Killed agent '${agent}'.`);
+            } else {
+                getCliChannel().show(true);
+                vscode.window.showErrorMessage(
+                    `Failed to kill agent '${agent}' (exit ${code}). See 'Agentic TaskTrees' output channel.`
+                );
+            }
         })
     );
 }
@@ -388,17 +430,58 @@ async function pickTask(): Promise<string | undefined> {
     return await vscode.window.showQuickPick(tasks, { placeHolder: 'Pick a task' });
 }
 
-function runDetached(cmd: string, args: string[]): Promise<void> {
+/**
+ * Lazily-created output channel for CLI invocations the extension makes
+ * (task / agent / recon). We need this on a separate channel from the
+ * per-task dev/setup channels so users can see *why* a button silently
+ * "succeeded".
+ */
+let cliChannel: vscode.OutputChannel | undefined;
+function getCliChannel(): vscode.OutputChannel {
+    if (!cliChannel) cliChannel = vscode.window.createOutputChannel('Agentic TaskTrees');
+    return cliChannel;
+}
+
+/**
+ * Run a CLI, capture stdout/stderr to the CLI output channel, and surface
+ * failures via a notification. Resolves with the exit code (or -1 on spawn
+ * error so callers can branch on success cleanly).
+ */
+function runCli(cmd: string, args: string[]): Promise<number> {
     return new Promise(resolve => {
         const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        const child = spawn(cmd, args, {
-            cwd: folder,
-            stdio: 'ignore',
-            detached: false,
-            env: process.env,
+        const channel = getCliChannel();
+        channel.appendLine(`\n$ ${cmd} ${args.join(' ')}   (cwd=${folder ?? '<none>'})`);
+        let child;
+        try {
+            child = spawn(cmd, args, {
+                cwd: folder,
+                stdio: ['ignore', 'pipe', 'pipe'],
+                detached: false,
+                env: process.env,
+            });
+        } catch (e: any) {
+            const msg = `Could not spawn '${cmd}': ${e?.message ?? e}`;
+            channel.appendLine(msg);
+            vscode.window.showErrorMessage(msg);
+            resolve(-1);
+            return;
+        }
+        child.stdout?.on('data', d => channel.append(d.toString()));
+        child.stderr?.on('data', d => channel.append(d.toString()));
+        child.on('exit', code => {
+            channel.appendLine(`[exit ${code}]`);
+            resolve(code ?? -1);
         });
-        child.on('exit', () => resolve());
-        child.on('error', () => resolve());
+        child.on('error', err => {
+            const msg = `'${cmd}' failed: ${err.message}`;
+            channel.appendLine(msg);
+            vscode.window.showErrorMessage(
+                `${msg}. Check 'Agentic TaskTrees' output channel for details; ` +
+                `you may need to set 'agenticTaskTrees.commands.${cmd === getCliCommands().task ? 'task' : cmd === getCliCommands().agent ? 'agent' : 'recon'}' to an absolute path.`
+            );
+            resolve(-1);
+        });
     });
 }
 

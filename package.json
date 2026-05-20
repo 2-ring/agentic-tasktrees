@@ -2,7 +2,7 @@
   "name": "agentic-tasktrees",
   "displayName": "Agentic TaskTrees",
   "description": "VSCode sidebar for managing parallel coding agents across git worktrees. Generic over project layout — dev servers and setup steps are configurable per workspace.",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -114,6 +114,11 @@
           "type": "number",
           "default": 3000,
           "description": "Background poll interval (milliseconds). The poll only repaints the tree when the snapshot actually changed."
+        },
+        "agenticTaskTrees.showStatusLabels": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show per-agent status text ('working', 'awaiting input', 'stopped', 'starting') next to each agent in the tree. Off by default — the icon already encodes the state."
         }
       }
     },

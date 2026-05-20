@@ -5,7 +5,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { colorForTask } from './colors';
 import { isDevRunning } from './dev';
-import { getCliCommands } from './config';
+import { getCliCommands, getShowStatusLabels } from './config';
 
 const pexec = promisify(exec);
 
@@ -56,9 +56,11 @@ export class AgentItem extends vscode.TreeItem {
         else if (status === 'input')   iconName = 'question';
         else                            iconName = baseIcon;
         this.iconPath = new vscode.ThemeIcon(iconName, color);
-        // Surface the status next to the name so the user can tell at a glance
-        // which agent is generating, which is waiting, and which is offline.
-        this.description = describeStatus(status);
+        // Status text next to the name — off by default; the icon already
+        // conveys the state. Users opt in via `agenticTaskTrees.showStatusLabels`.
+        if (getShowStatusLabels()) {
+            this.description = describeStatus(status);
+        }
         this.tooltip = `Agent: ${name}\nID: ${agent}\nTask: ${task}\nStatus: ${status}\n\nClick to open in a terminal panel.`;
         this.command = {
             command: 'agentic-tasktrees.openAgent',
@@ -157,6 +159,11 @@ export class TasksProvider implements vscode.TreeDataProvider<TreeNode> {
         })();
         this.pollInFlight = run;
         return run;
+    }
+
+    /** Names of all agents currently in the snapshot for `task`. Empty if unknown. */
+    agentsForTask(task: string): string[] {
+        return this.snapshot.find(t => t.task === task)?.agents.map(a => a.name) ?? [];
     }
 
     getTreeItem(element: TreeNode): vscode.TreeItem {
