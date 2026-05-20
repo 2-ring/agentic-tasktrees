@@ -2,7 +2,7 @@
   "name": "agentic-tasktrees",
   "displayName": "Agentic TaskTrees",
   "description": "VSCode sidebar for managing parallel coding agents across git worktrees. Generic over project layout — dev servers and setup steps are configurable per workspace.",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "publisher": "local",
   "license": "MIT",
   "repository": {

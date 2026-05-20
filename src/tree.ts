@@ -46,11 +46,15 @@ export class AgentItem extends vscode.TreeItem {
         // Visually distinguish the orchestrator from other agents.
         // Agents share their parent task's color so the tree groups by hue.
         const color = colorForTask(task);
-        // `sync~spin` is a codicon with the spin animation modifier — VS Code
-        // renders the rotating sync glyph in tree icons. Falls back to a static
-        // sync icon in older clients.
+        // Icon encodes status, with role as the fallback for "idle":
+        //   working → spinning sync (the `~spin` modifier animates in tree icons)
+        //   input   → question mark (waiting on a user question / permission prompt)
+        //   else    → role icon (mortar-board for orchestrator, robot for sub-agents)
         const baseIcon = isOrchestrator(agent, task) ? 'mortar-board' : 'robot';
-        const iconName = status === 'working' ? 'sync~spin' : baseIcon;
+        let iconName: string;
+        if (status === 'working')      iconName = 'sync~spin';
+        else if (status === 'input')   iconName = 'question';
+        else                            iconName = baseIcon;
         this.iconPath = new vscode.ThemeIcon(iconName, color);
         // Surface the status next to the name so the user can tell at a glance
         // which agent is generating, which is waiting, and which is offline.

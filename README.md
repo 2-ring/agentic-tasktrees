@@ -48,8 +48,8 @@ Each agent's icon reflects what it's doing right now, polled from `recon json`:
 | Status   | Icon                       | Description shown next to name | Meaning                                  |
 |----------|----------------------------|--------------------------------|------------------------------------------|
 | Working  | spinning sync 🔄            | _(none — the spin is the cue)_ | LLM is actively generating tokens        |
-| Input    | role icon                  | `awaiting input`               | Agent prompted the user                  |
-| Idle     | role icon                  | _(none)_                       | Waiting for the next message             |
+| Input    | question mark ❓            | `awaiting input`               | Agent is waiting on a user question or permission prompt |
+| Idle     | role icon (🎓 / 🤖)         | _(none)_                       | Waiting for the next message             |
 | New      | role icon                  | `starting`                     | Session just spawned, no tokens yet      |
 | Dead     | role icon                  | `stopped`                      | Tracked in `.agents` but no live tmux session — clicking auto-resumes the prior conversation via `agent <id> resume` |
 
