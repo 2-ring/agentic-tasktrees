@@ -119,7 +119,8 @@ The extension is a UI over the `task` and `agent` CLIs. From the sidebar you can
 - **New Agent** (per task) — prompts for name, role, and initial message; runs `agent new --task <task>`.
 - **Edit BUNDLE.md** — opens the task's spec in a new editor tab.
 - **Finish Task** — runs `task <id> finish` (interactive review/merge/cleanup) in a new terminal.
-- **Kill Task / Kill Agent** — two-step confirmation, then `task <id> kill` / `agent <id> kill`.
+- **Delete Task** (🗑) — two-step confirmation, then kills every agent and removes the worktree directory via `git worktree remove --force`. Discards uncommitted changes in that worktree. The branch is kept so the work isn't lost — use **Finish** first if you want it merged.
+- **Kill Agent** — two-step confirmation, then `agent <id> kill` (removes the single agent from tmux + `.agents` registry).
 - **Open Agent Terminal** — `tmux attach`s to the agent's session in a VSCode terminal, with the task's stable color and the role's icon. If the session is dead, auto-resumes via `agent <id> resume` first.
 
 ### Clean, intuitive, customizable UI

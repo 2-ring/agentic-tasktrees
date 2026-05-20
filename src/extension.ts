@@ -336,46 +336,63 @@ export function activate(context: vscode.ExtensionContext) {
             const task = item?.task ?? (await pickTask());
             if (!task) return;
             const agents = provider.agentsForTask(task);
-            const summary = agents.length === 0
-                ? `Task '${task}' has no live agents tracked — proceed anyway?`
-                : `Kill all ${agents.length} agent(s) for task '${task}'?\n\n` +
-                  agents.map(a => `  • ${a}`).join('\n') +
-                  `\n\n(Worktree stays — use Finish to merge & clean up.)`;
-            const c1 = await vscode.window.showWarningMessage(summary, { modal: true }, 'Kill');
-            if (c1 !== 'Kill') return;
+            const root = await repoRoot();
+            const wtPath = root ? `${root}/.worktrees/${task}` : `.worktrees/${task}`;
+            const head = agents.length === 0
+                ? `Delete task '${task}'? No live agents tracked.`
+                : `Delete task '${task}' and kill its ${agents.length} agent(s)?\n\n` +
+                  agents.map(a => `  • ${a}`).join('\n');
+            const body = `\n\nThis will:\n` +
+                `  • kill every agent for this task (tmux + .agents registry)\n` +
+                `  • remove the worktree directory at ${wtPath}\n` +
+                `  • DISCARD any uncommitted changes in that worktree\n\n` +
+                `Use Finish (✓) instead if you want to merge to main first. ` +
+                `The branch itself is kept.`;
+            const c1 = await vscode.window.showWarningMessage(head + body, { modal: true }, 'Delete');
+            if (c1 !== 'Delete') return;
             const c2 = await vscode.window.showWarningMessage(
-                `Are you sure you're sure?`,
+                `Really delete '${task}'? This cannot be undone.`,
                 { modal: true },
-                'Yes, kill'
+                'Yes, delete'
             );
-            if (c2 !== 'Yes, kill') return;
+            if (c2 !== 'Yes, delete') return;
 
-            // Kill each agent directly. The `task <id> kill` script has a stale
-            // recon-tag filter and only catches sessions whose tmux name starts
-            // with `<task>-`, so sub-agents survive. Iterating `agent <id> kill`
-            // per cached snapshot entry is reliable and surfaces per-agent errors.
+            // Step 1: kill each agent directly. The `task <id> kill` script has a
+            // stale recon-tag filter that misses sub-agents — iterating
+            // `agent <id> kill` per cached snapshot entry is reliable.
             const cli = getCliCommands();
             const results = await Promise.all(
                 agents.map(async a => ({ agent: a, code: await runCli(cli.agent, [a, 'kill']) }))
             );
-            const failed = results.filter(r => r.code !== 0);
-            const succeeded = results.length - failed.length;
+            const failedKills = results.filter(r => r.code !== 0);
+            const succeededKills = results.length - failedKills.length;
 
-            // Force an immediate poll so the tree reflects the kill without waiting
-            // for the next interval tick.
+            // Step 2: remove the worktree. --force tolerates uncommitted changes,
+            // which the user just confirmed they're willing to lose.
+            let worktreeRemoved = false;
+            let worktreeError: string | undefined;
+            if (root) {
+                const code = await runCli('git', ['worktree', 'remove', '--force', wtPath]);
+                if (code === 0) {
+                    worktreeRemoved = true;
+                } else {
+                    worktreeError = `git worktree remove exited ${code}`;
+                }
+            } else {
+                worktreeError = 'no repo root resolved';
+            }
+
             await provider.poll(true);
 
-            if (failed.length === 0) {
-                vscode.window.showInformationMessage(
-                    `Killed ${succeeded}/${results.length} agent(s) for task '${task}'.`
-                );
+            const parts: string[] = [];
+            parts.push(`Killed ${succeededKills}/${results.length} agent(s)`);
+            parts.push(worktreeRemoved ? 'removed worktree' : `worktree NOT removed (${worktreeError})`);
+            const msg = `Task '${task}': ${parts.join('; ')}.`;
+            if (failedKills.length === 0 && worktreeRemoved) {
+                vscode.window.showInformationMessage(msg);
             } else {
                 getCliChannel().show(true);
-                vscode.window.showWarningMessage(
-                    `Killed ${succeeded}/${results.length}; ${failed.length} failed: ` +
-                    failed.map(f => f.agent).join(', ') +
-                    `. See 'Agentic TaskTrees' output channel.`
-                );
+                vscode.window.showWarningMessage(`${msg} See 'Agentic TaskTrees' output channel.`);
             }
         }),
 
