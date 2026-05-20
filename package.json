@@ -1,0 +1,253 @@
+{
+  "name": "agentic-tasktrees",
+  "displayName": "Agentic TaskTrees",
+  "description": "VSCode sidebar for managing parallel coding agents across git worktrees. Generic over project layout — dev servers and setup steps are configurable per workspace.",
+  "version": "0.6.0",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/2-ring/agentic-tasktrees.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onUri",
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Agentic TaskTrees",
+      "properties": {
+        "agenticTaskTrees.devServers": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "Dev servers spawned by **Start Dev Servers**. Each task gets distinct ports derived from `portBase` + a per-task offset (persisted in `.vscode/agentic-tasktrees.json`). Empty array disables the feature.",
+          "items": {
+            "type": "object",
+            "required": ["name", "cwd", "command"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Identifier (e.g. 'backend', 'web'). Used as Output channel header."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory. Supports ${worktree} (the task worktree root) and ${task} (task name)."
+              },
+              "command": {
+                "type": "string",
+                "description": "Executable to spawn. Supports ${worktree}, ${task}."
+              },
+              "args": {
+                "type": "array",
+                "items": { "type": "string" },
+                "default": [],
+                "description": "Arguments. Supports ${worktree}, ${task}, ${port}."
+              },
+              "portBase": {
+                "type": "number",
+                "description": "Base port; final port = portBase + per-task offset. Omit if the server doesn't need a port."
+              },
+              "portEnv": {
+                "type": "string",
+                "description": "Optional env var to set with the assigned port (e.g. 'PORT')."
+              },
+              "openInBrowser": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, 'Open Test URL' opens http://localhost:<port> for this server."
+              }
+            }
+          }
+        },
+        "agenticTaskTrees.setup": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "Per-task setup steps (e.g. `npm install`, `python -m venv`). Run lazily before the first **Start Dev Servers**, and in the background when new tasks appear. Empty array disables the feature.",
+          "items": {
+            "type": "object",
+            "required": ["name", "cwd"],
+            "properties": {
+              "name": { "type": "string", "description": "Display name shown in the Output channel." },
+              "cwd": { "type": "string", "description": "Working directory. Supports ${worktree}, ${task}." },
+              "trigger": {
+                "type": "string",
+                "description": "Run this setup only if this file (relative to cwd) exists. Skip otherwise."
+              },
+              "skipMarker": {
+                "type": "string",
+                "description": "If this file (relative to cwd) already exists, setup is considered complete and is skipped."
+              },
+              "steps": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["command"],
+                  "properties": {
+                    "command": { "type": "string", "description": "Supports ${worktree}, ${task}." },
+                    "args": { "type": "array", "items": { "type": "string" }, "default": [] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "agenticTaskTrees.commands.task": {
+          "type": "string",
+          "default": "task",
+          "description": "CLI invoked for `task new`, `task <name> kill`, `task <name> finish`. Must accept those subcommands."
+        },
+        "agenticTaskTrees.commands.agent": {
+          "type": "string",
+          "default": "agent",
+          "description": "CLI invoked for `agent new --task <task> <name> <role> <desc>`, `agent <id> resume`, `agent <id> kill`."
+        },
+        "agenticTaskTrees.commands.recon": {
+          "type": "string",
+          "default": "recon",
+          "description": "CLI invoked as `recon json` to enumerate live agent sessions. Set to an absolute path if the binary is not on the extension host's PATH."
+        },
+        "agenticTaskTrees.pollIntervalMs": {
+          "type": "number",
+          "default": 3000,
+          "description": "Background poll interval (milliseconds). The poll only repaints the tree when the snapshot actually changed."
+        }
+      }
+    },
+    "views": {
+      "explorer": [
+        {
+          "id": "agenticTaskTrees.tree",
+          "name": "Agentic TaskTrees",
+          "icon": "$(rocket)",
+          "contextualTitle": "Agentic TaskTrees"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "agentic-tasktrees.openAgent",
+        "title": "Agentic TaskTrees: Open Agent Terminal"
+      },
+      {
+        "command": "agentic-tasktrees.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "agentic-tasktrees.newTask",
+        "title": "New Task",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "agentic-tasktrees.newAgent",
+        "title": "New Agent",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentic-tasktrees.editBundle",
+        "title": "Edit BUNDLE.md",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "agentic-tasktrees.startDev",
+        "title": "Start Dev Servers",
+        "icon": "$(play)"
+      },
+      {
+        "command": "agentic-tasktrees.stopDev",
+        "title": "Stop Dev Servers",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "agentic-tasktrees.test",
+        "title": "Open Test URL",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "agentic-tasktrees.taskMore",
+        "title": "More Actions…",
+        "icon": "$(ellipsis)"
+      },
+      {
+        "command": "agentic-tasktrees.showDevLogs",
+        "title": "Show Dev Logs",
+        "icon": "$(output)"
+      },
+      {
+        "command": "agentic-tasktrees.finishTask",
+        "title": "Finish Task",
+        "icon": "$(check)"
+      },
+      {
+        "command": "agentic-tasktrees.killTask",
+        "title": "Kill Task",
+        "icon": "$(close)"
+      },
+      {
+        "command": "agentic-tasktrees.killAgent",
+        "title": "Kill Agent",
+        "icon": "$(close)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "agentic-tasktrees.newTask",
+          "when": "view == agenticTaskTrees.tree",
+          "group": "navigation@1"
+        },
+        {
+          "command": "agentic-tasktrees.refresh",
+          "when": "view == agenticTaskTrees.tree",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "agentic-tasktrees.newAgent",
+          "when": "view == agenticTaskTrees.tree && (viewItem == task || viewItem == task-dev-running)",
+          "group": "inline@1"
+        },
+        {
+          "command": "agentic-tasktrees.finishTask",
+          "when": "view == agenticTaskTrees.tree && (viewItem == task || viewItem == task-dev-running)",
+          "group": "inline@2"
+        },
+        {
+          "command": "agentic-tasktrees.killTask",
+          "when": "view == agenticTaskTrees.tree && (viewItem == task || viewItem == task-dev-running)",
+          "group": "inline@3"
+        },
+        {
+          "command": "agentic-tasktrees.taskMore",
+          "when": "view == agenticTaskTrees.tree && (viewItem == task || viewItem == task-dev-running)",
+          "group": "inline@4"
+        },
+        {
+          "command": "agentic-tasktrees.killAgent",
+          "when": "view == agenticTaskTrees.tree && viewItem == agent",
+          "group": "inline@1"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package --out agentic-tasktrees.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.4.0"
+  },
+  "categories": [
+    "Other"
+  ]
+}
