@@ -2,7 +2,7 @@
   "name": "agentic-tasktrees",
   "displayName": "Agentic TaskTrees",
   "description": "VSCode sidebar for managing parallel coding agents across git worktrees. Generic over project layout — dev servers and setup steps are configurable per workspace.",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -119,6 +119,11 @@
           "type": "boolean",
           "default": false,
           "description": "Show per-agent status text ('working', 'awaiting input', 'stopped', 'starting') next to each agent in the tree. Off by default — the icon already encodes the state."
+        },
+        "agenticTaskTrees.mainBranch": {
+          "type": "string",
+          "default": "main",
+          "description": "Target branch for the 'Sync to main' command. The extension runs `git merge --no-ff <wt-branch> -m <msg>` against this branch in the main workspace."
         }
       }
     },
@@ -196,6 +201,11 @@
         "command": "agentic-tasktrees.killAgent",
         "title": "Kill Agent",
         "icon": "$(close)"
+      },
+      {
+        "command": "agentic-tasktrees.syncTask",
+        "title": "Sync to main (keep working)",
+        "icon": "$(git-merge)"
       }
     ],
     "menus": {

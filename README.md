@@ -121,6 +121,7 @@ The extension is a UI over the `task` and `agent` CLIs. From the sidebar you can
 - **Finish Task** — runs `task <id> finish` (interactive review/merge/cleanup) in a new terminal.
 - **Delete Task** (🗑) — two-step confirmation, then kills every agent and removes the worktree directory via `git worktree remove --force`. Discards uncommitted changes in that worktree. The branch is kept so the work isn't lost — use **Finish** first if you want it merged.
 - **Kill Agent** — two-step confirmation, then `agent <id> kill` (removes the single agent from tmux + `.agents` registry).
+- **Sync to main (keep working)** — under **More Actions… → 🔀 Sync to main (keep working)**. Runs `git merge --no-ff <wt-branch> -m <your-message>` against your main branch so the task's work lands on main *now*, but the worktree, branch, agents, and dev servers are all left alive. Use this when you're happy with the progress so far but not done. One merge commit per sync — re-syncing later just adds another commit, no manual reconciliation. On conflict, main is left untouched and you get explicit recovery steps. Configurable via `agenticTaskTrees.mainBranch` (default `main`).
 - **Open Agent Terminal** — `tmux attach`s to the agent's session in a VSCode terminal, with the task's stable color and the role's icon. If the session is dead, auto-resumes via `agent <id> resume` first.
 
 ### Clean, intuitive, customizable UI

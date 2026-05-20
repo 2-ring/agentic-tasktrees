@@ -92,6 +92,12 @@ export function getShowStatusLabels(): boolean {
     return section().get<boolean>('showStatusLabels') ?? false;
 }
 
+/** Target branch for `Sync to main`. Defaults to `main`. */
+export function getMainBranch(): string {
+    const v = section().get<string>('mainBranch');
+    return (typeof v === 'string' && v.trim()) ? v.trim() : 'main';
+}
+
 /**
  * Replace `${worktree}`, `${task}`, `${port}` (when supplied) in a string.
  * Unknown placeholders are left as-is so users notice typos.

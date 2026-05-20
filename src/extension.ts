@@ -26,7 +26,8 @@ import {
     getRunningPort,
 } from './dev';
 import { markFreshlyCreated } from './setup';
-import { getCliCommands, getDevServers, getPollIntervalMs } from './config';
+import { getCliCommands, getDevServers, getPollIntervalMs, getMainBranch } from './config';
+import * as path from 'path';
 
 /**
  * Agentic TaskTrees extension.
@@ -282,6 +283,7 @@ export function activate(context: vscode.ExtensionContext) {
             const devRunning = isDevRunning(task);
             const choices: Array<vscode.QuickPickItem & { id: string }> = [
                 { id: 'edit',  label: '$(edit) Edit BUNDLE.md', description: 'Open the task description for manual editing' },
+                { id: 'sync',  label: '$(git-merge) Sync to main (keep working)', description: `Merge this task's branch into ${getMainBranch()}, but keep the worktree and agents alive` },
                 devRunning
                     ? { id: 'stop',  label: '$(debug-stop) Stop dev servers', description: 'Stop the backend + web background processes' }
                     : { id: 'start', label: '$(play) Start dev servers',     description: 'Backend + web in this worktree (background, port-shifted)' },
@@ -296,6 +298,7 @@ export function activate(context: vscode.ExtensionContext) {
             const itemArg = item;
             switch (picked.id) {
                 case 'edit':    return vscode.commands.executeCommand('agentic-tasktrees.editBundle', itemArg);
+                case 'sync':    return vscode.commands.executeCommand('agentic-tasktrees.syncTask', itemArg);
                 case 'start':   return vscode.commands.executeCommand('agentic-tasktrees.startDev', itemArg);
                 case 'stop':    return vscode.commands.executeCommand('agentic-tasktrees.stopDev', itemArg);
                 case 'logs':    return vscode.commands.executeCommand('agentic-tasktrees.showDevLogs', itemArg);
@@ -426,6 +429,148 @@ export function activate(context: vscode.ExtensionContext) {
                     `Failed to kill agent '${agent}' (exit ${code}). See 'Agentic TaskTrees' output channel.`
                 );
             }
+        }),
+
+        // ───── Sync to main (keep working) ─────
+        // Merges the task's branch into the configured main branch via
+        // `git merge --no-ff -m <msg>` inside REPO_ROOT. Worktree, branch,
+        // agents, and dev servers are not touched — designed for iterative
+        // "checkpoint" merges. Per-sync merge commits keep the merge-base
+        // advancing cleanly so re-syncing the same task later works without
+        // any manual reconciliation in the worktree.
+        vscode.commands.registerCommand('agentic-tasktrees.syncTask', async (item?: TaskItem) => {
+            const task = item?.task ?? (await pickTask());
+            if (!task) return;
+            const root = await repoRoot();
+            if (!root) {
+                vscode.window.showErrorMessage('No git repo root resolved for the workspace.');
+                return;
+            }
+            const mainBranch = getMainBranch();
+            const wtPath = path.join(root, '.worktrees', task);
+
+            // Detect the worktree's actual branch (don't assume `wt/<task>`,
+            // since users may have set up custom branch names).
+            let branch: string;
+            try {
+                const { stdout } = await pexec(
+                    `git -C ${shellQuote(wtPath)} rev-parse --abbrev-ref HEAD`
+                );
+                branch = stdout.trim();
+            } catch (e: any) {
+                vscode.window.showErrorMessage(
+                    `Could not read branch for '${task}' at ${wtPath}: ${e?.message ?? e}`
+                );
+                return;
+            }
+            if (!branch || branch === 'HEAD') {
+                vscode.window.showErrorMessage(
+                    `Worktree '${task}' is in a detached HEAD state — nothing to sync.`
+                );
+                return;
+            }
+
+            // --- pre-flight ---
+            // 1. Worktree clean.
+            try {
+                const { stdout } = await pexec(
+                    `git -C ${shellQuote(wtPath)} status --porcelain`
+                );
+                if (stdout.trim()) {
+                    vscode.window.showWarningMessage(
+                        `Worktree '${task}' has uncommitted changes. Commit them on '${branch}' first so they're included in the sync.`
+                    );
+                    return;
+                }
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`git status failed in worktree: ${e?.message ?? e}`);
+                return;
+            }
+
+            // 2. REPO_ROOT clean.
+            try {
+                const { stdout } = await pexec(`git -C ${shellQuote(root)} status --porcelain`);
+                if (stdout.trim()) {
+                    vscode.window.showWarningMessage(
+                        `Main workspace has uncommitted changes. Commit or stash before syncing.`
+                    );
+                    return;
+                }
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`git status failed in main repo: ${e?.message ?? e}`);
+                return;
+            }
+
+            // 3. REPO_ROOT on the configured main branch.
+            let currentMain: string;
+            try {
+                const { stdout } = await pexec(`git -C ${shellQuote(root)} rev-parse --abbrev-ref HEAD`);
+                currentMain = stdout.trim();
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`git rev-parse failed in main repo: ${e?.message ?? e}`);
+                return;
+            }
+            if (currentMain !== mainBranch) {
+                vscode.window.showWarningMessage(
+                    `Main workspace is on '${currentMain}', not '${mainBranch}'. ` +
+                    `Check out '${mainBranch}' first (or set 'agenticTaskTrees.mainBranch' if that's incorrect).`
+                );
+                return;
+            }
+
+            // 4. Branch has commits ahead of mainBranch.
+            try {
+                const { stdout } = await pexec(
+                    `git -C ${shellQuote(root)} rev-list --count ${shellQuote(mainBranch)}..${shellQuote(branch)}`
+                );
+                if (stdout.trim() === '0') {
+                    vscode.window.showInformationMessage(
+                        `Nothing to sync — '${branch}' has no commits beyond '${mainBranch}'.`
+                    );
+                    return;
+                }
+            } catch (e: any) {
+                vscode.window.showErrorMessage(
+                    `git rev-list failed: ${e?.message ?? e}. ` +
+                    `Does '${branch}' exist in the main repo?`
+                );
+                return;
+            }
+
+            // --- prompt for commit message ---
+            const prefix = `Sync ${task}: `;
+            const msg = await vscode.window.showInputBox({
+                prompt: `Commit message for syncing '${task}' into ${mainBranch}`,
+                value: prefix,
+                valueSelection: [prefix.length, prefix.length],
+                validateInput: v =>
+                    v.trim() === prefix.trim() || v.trim() === ''
+                        ? 'Add a short description after the colon.'
+                        : null,
+            });
+            if (!msg) return;
+
+            // --- merge ---
+            const code = await runCli('git', ['-C', root, 'merge', '--no-ff', branch, '-m', msg]);
+            if (code !== 0) {
+                // Defensive abort — git auto-aborts on conflict, but make sure
+                // there's no half-merged state left behind for any reason.
+                await runCli('git', ['-C', root, 'merge', '--abort']);
+                getCliChannel().show(true);
+                vscode.window.showErrorMessage(
+                    `Merge of '${branch}' into '${mainBranch}' failed (likely a conflict). ` +
+                    `Recovery: in a terminal, run ` +
+                    `\`git -C ${wtPath} merge ${mainBranch}\`, resolve conflicts in the worktree, ` +
+                    `commit, then re-run Sync. The worktree and agents are unaffected; ` +
+                    `'${mainBranch}' is unchanged.`
+                );
+                return;
+            }
+
+            await provider.poll(true);
+            vscode.window.showInformationMessage(
+                `Synced '${task}' to ${mainBranch}. Worktree and agents continue running.`
+            );
         })
     );
 }
