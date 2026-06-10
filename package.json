@@ -254,7 +254,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile",
-    "package": "vsce package --out agentic-tasktrees.vsix"
+    "package": "vsce package"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

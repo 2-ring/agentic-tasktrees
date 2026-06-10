@@ -23,7 +23,13 @@ cli/
 
 ## Install
 
-These scripts shell out to [`recon`](https://github.com/gavraz/recon) (a tmux-native session dashboard) and `tmux`, and launch the [Claude Code](https://claude.ai/code) CLI inside each agent. Install those first, then:
+These scripts shell out to [`recon`](https://github.com/gavraz/recon) (a tmux-native session dashboard) and `tmux`, and launch the [Claude Code](https://claude.ai/code) CLI inside each agent. Install those first — `recon` comes from git (not `cargo install recon`, which is an unrelated crate):
+
+```bash
+cargo install --git https://github.com/gavraz/recon
+```
+
+Then:
 
 ```bash
 # 1. Put the global entrypoints on your PATH

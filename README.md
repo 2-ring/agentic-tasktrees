@@ -157,7 +157,13 @@ The extension shells out to three CLIs:
 
 `task` and `agent` (plus the per-task launcher scripts they invoke) ship in this repo under [`cli/`](cli/) — see [`cli/README.md`](cli/README.md) for the install steps. They're plain Bash; you can substitute your own implementations as long as they honor the same subcommand surface.
 
-The only external dependency is [`recon`](https://github.com/gavraz/recon), a tmux-native session dashboard (`cargo install` it). You also need `tmux` and a [Claude Code](https://claude.ai/code) (or compatible) CLI inside each agent's session.
+The only external dependency is [`recon`](https://github.com/gavraz/recon), a tmux-native session dashboard. Install it from git:
+
+```bash
+cargo install --git https://github.com/gavraz/recon
+```
+
+(Install from git, not `cargo install recon` — the `recon` name on crates.io is an unrelated package.) You also need `tmux` and a [Claude Code](https://claude.ai/code) (or compatible) CLI inside each agent's session.
 
 ---
 
@@ -173,7 +179,7 @@ code --install-extension agentic-tasktrees-*.vsix
 
 Then reload VSCode. Open the Explorer pane — you'll see **AGENTIC TASKTREES** at the bottom.
 
-Install the CLI it drives by following [`cli/README.md`](cli/README.md): put `cli/bin/{task,agent}` on your `PATH`, drop `cli/scripts/*` + `cli/templates/bundle.md` into the project you want to manage, and `cargo install` [`recon`](https://github.com/gavraz/recon).
+Install the CLI it drives by following [`cli/README.md`](cli/README.md): put `cli/bin/{task,agent}` on your `PATH`, drop `cli/scripts/*` + `cli/templates/bundle.md` into the project you want to manage, and install [`recon`](https://github.com/gavraz/recon) with `cargo install --git https://github.com/gavraz/recon`.
 
 ---
 
