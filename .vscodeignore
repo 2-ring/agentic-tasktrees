@@ -4,5 +4,6 @@
 src/**
 cli/**
 tsconfig.json
+icon.svg
 **/*.map
 **/*.vsix
