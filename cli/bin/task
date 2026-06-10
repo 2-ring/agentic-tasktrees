@@ -107,10 +107,32 @@ if [[ "$action" == "new" ]]; then
   path="${WT_DIR}/${name}"
   branch="wt/${name}"
 
+  main_branch="main"
+
   [ -d "$path" ] && { echo "Error: task already exists at $path" >&2; exit 1; }
+
   if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${branch}"; then
-    echo "Error: branch ${branch} already exists" >&2
-    exit 1
+    # The branch already exists. Three cases:
+    #   1. A live worktree still uses it      → a real active task; refuse.
+    #   2. No worktree, branch merged to main → stale leftover from a finished/
+    #                                           deleted task; recycle the name.
+    #   3. No worktree, branch NOT merged     → holds unmerged work; refuse, but
+    #                                           show how to inspect or drop it.
+    if git -C "$REPO_ROOT" worktree list --porcelain | grep -qx "branch refs/heads/${branch}"; then
+      echo "Error: task '${name}' is already active (its worktree and branch exist)." >&2
+      echo "  Pick another name, or finish the existing one:  task ${name} finish" >&2
+      exit 1
+    elif git -C "$REPO_ROOT" merge-base --is-ancestor "${branch}" "${main_branch}" 2>/dev/null; then
+      echo "Note: recycling stale branch ${branch} (already merged into ${main_branch}) from a previous task."
+      git -C "$REPO_ROOT" branch -D "${branch}" >/dev/null
+    else
+      echo "Error: branch ${branch} already exists with commits not in ${main_branch}." >&2
+      echo "  It's left over from an earlier '${name}' task that was never merged. Either:" >&2
+      echo "    - choose a different task name, or" >&2
+      echo "    - inspect it:  git -C ${REPO_ROOT} log ${main_branch}..${branch}" >&2
+      echo "    - drop it:     git -C ${REPO_ROOT} branch -D ${branch}" >&2
+      exit 1
+    fi
   fi
 
   # Prompt for description if not given.

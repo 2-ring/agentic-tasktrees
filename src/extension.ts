@@ -172,16 +172,17 @@ export function activate(context: vscode.ExtensionContext) {
             });
             if (desc === undefined) return;
 
-            await vscode.window.withProgress(
+            const code = await vscode.window.withProgress(
                 {
                     location: vscode.ProgressLocation.Notification,
                     title: `Creating task '${name}'…`,
                     cancellable: false,
                 },
-                async () => {
-                    await runCli(getCliCommands().task, ['new', name, desc, '--no-attach']);
-                }
+                async () => runCli(getCliCommands().task, ['new', name, desc, '--no-attach'])
             );
+            // task new failed (e.g. name collision) — runCli already surfaced the
+            // error notification. Don't claim success or kick off setup.
+            if (code !== 0) return;
             // Kick off dep install immediately (npm / venv) in the background.
             markFreshlyCreated(name);
             provider.refresh();
@@ -629,10 +630,20 @@ function runCli(cmd: string, args: string[]): Promise<number> {
             resolve(-1);
             return;
         }
+        let errBuf = '';
         child.stdout?.on('data', d => channel.append(d.toString()));
-        child.stderr?.on('data', d => channel.append(d.toString()));
+        child.stderr?.on('data', d => { const s = d.toString(); errBuf += s; channel.append(s); });
         child.on('exit', code => {
             channel.appendLine(`[exit ${code}]`);
+            if (code && code !== 0) {
+                // Surface the failure — the first `Error:` line from the CLI is the
+                // useful bit; fall back to the last non-empty stderr line.
+                const lines = errBuf.split('\n').map(l => l.trim()).filter(Boolean);
+                const detail = lines.find(l => /^error:/i.test(l)) ?? lines[lines.length - 1] ?? `exited with code ${code}`;
+                vscode.window
+                    .showErrorMessage(`${cmd} ${args[0] ?? ''} failed: ${detail}`, 'Show Output')
+                    .then(choice => { if (choice === 'Show Output') channel.show(); });
+            }
             resolve(code ?? -1);
         });
         child.on('error', err => {
