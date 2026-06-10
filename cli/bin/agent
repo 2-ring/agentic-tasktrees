@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# agent - parallel-agent controller (operates on agents inside tasks).
+#
+# Subcommands:
+#   agent new                                          Interactive: prompts for name, role, description, task
+#   agent new <name> <role> <description>              Non-interactive; task inferred from $WT_BUNDLE
+#   agent new --task <task> <name> <role> <description>  Explicit task (use from outside a task)
+#   agent list [task]                                  List live agents, optionally filtered by task
+#   agent <id> kill                                    Kill an agent (its tmux session + registry)
+#   agent <id> resume                                  Restart a dead agent (after reboot) with its prior conversation
+#   agent <id> message <text...>                       Send [MESSAGE] to an agent
+#   agent help                                         Show this help
+#
+# Agent IDs are globally unique (kebab-case). The id IS the tmux session name.
+# Each agent is associated with one task; the association is via the bundle:<task>
+# recon tag and the agent's $WT_BUNDLE env var.
+
+set -euo pipefail
+
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "Error: not in a git repository" >&2
+  exit 1
+}
+if [[ "$REPO_ROOT" == */.worktrees/* ]]; then
+  REPO_ROOT="${REPO_ROOT%/.worktrees/*}"
+fi
+WT_DIR="${REPO_ROOT}/.worktrees"
+
+# --- Subcommand dispatch -----------------------------------------------------
+
+first="${1:-help}"
+shift || true
+
+case "$first" in
+  new)           action="new" ;;
+  list)          action="list" ;;
+  help|-h|--help|"") action="help" ;;
+  *)
+    # First arg is an agent id. Action follows.
+    agent_id="$first"
+    action="${1:-}"
+    shift || true
+    [[ -z "$action" ]] && { echo "Usage: agent <id> {kill|message <text>}" >&2; exit 1; }
+    ;;
+esac
+
+# --- agent help --------------------------------------------------------------
+
+if [[ "$action" == "help" ]]; then
+  sed -n '2,15p' "$0"
+  exit 0
+fi
+
+# --- agent new ---------------------------------------------------------------
+
+if [[ "$action" == "new" ]]; then
+  # Parse --task <id> if present (anywhere).
+  task_id=""
+  args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --task)  task_id="${2:?--task needs a value}"; shift 2 ;;
+      *)       args+=("$1"); shift ;;
+    esac
+  done
+
+  # If no explicit --task, infer from env (orchestrator inherits this).
+  [[ -z "$task_id" ]] && task_id="${WT_BUNDLE:-}"
+
+  # Guard: an orchestrator/agent already inside a worktree shouldn't spawn an
+  # agent into a different task by accident. If WT_BUNDLE is set AND the user
+  # passed --task explicitly AND it disagrees, refuse loudly. (A human shell
+  # without WT_BUNDLE can still use --task freely.)
+  if [[ -n "${WT_BUNDLE:-}" && -n "$task_id" && "$task_id" != "${WT_BUNDLE}" ]]; then
+    echo "Error: refusing to create agent in task '$task_id' while inside task '${WT_BUNDLE}'." >&2
+    echo "  - If you meant to spawn an agent here, drop the --task flag (it auto-detects)." >&2
+    echo "  - If you really need to target a different task, run from a normal shell." >&2
+    exit 1
+  fi
+
+  # Positional args: name, role, description.
+  name="${args[0]:-}"
+  role="${args[1]:-}"
+  description="${args[2]:-}"
+
+  non_interactive=0
+  [[ -n "$task_id" && -n "$name" && -n "$role" && -n "$description" ]] && non_interactive=1
+
+  # Prompt for missing fields.
+  if [[ -z "$task_id" ]]; then
+    read -r -p "Task ID (the bundle this agent belongs to): " task_id
+    [[ -z "$task_id" ]] && { echo "Aborted."; exit 1; }
+  fi
+  if [[ -z "$name" ]]; then
+    read -r -p "Agent name (kebab-case, globally unique): " name
+    [[ -z "$name" ]] && { echo "Aborted."; exit 1; }
+  fi
+  if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "Error: agent name must be lowercase letters/numbers/dashes (start with letter/number)" >&2
+    exit 1
+  fi
+  if [[ -z "$role" ]]; then
+    read -r -p "Role (e.g. tester, cleanup, section-builder): " role
+    role="${role:-agent}"
+  fi
+  if [[ -z "$description" ]]; then
+    echo "Describe the agent's initial task (one or two lines, Ctrl+D to finish):"
+    description="$(cat)"
+  fi
+
+  # Validations.
+  path="${WT_DIR}/${task_id}"
+  [ -d "$path" ] || { echo "Error: no task '$task_id' (no worktree at $path)" >&2; exit 1; }
+  if tmux has-session -t "$name" 2>/dev/null; then
+    echo "Error: agent id '$name' already exists as a tmux session" >&2
+    exit 1
+  fi
+  if ! command -v recon >/dev/null 2>&1; then
+    echo "Error: 'recon' not on PATH. Run '. ~/.cargo/env' first." >&2
+    exit 1
+  fi
+  if [ ! -x "${path}/scripts/agent-launch" ]; then
+    echo "Error: agent launcher missing at ${path}/scripts/agent-launch" >&2
+    exit 1
+  fi
+
+  # Confirmation (interactive only).
+  if [[ $non_interactive -eq 0 ]]; then
+    echo
+    echo "── About to launch ──────────────────────────────"
+    echo "  Agent:        $name"
+    echo "  Task:         $task_id"
+    echo "  Role:         $role"
+    echo "  Description:  $(echo "$description" | head -c 120)$([ $(echo "$description" | wc -c) -gt 120 ] && echo "...")"
+    echo "─────────────────────────────────────────────────"
+    read -r -p "Proceed? [Y/n] " confirm
+    confirm="${confirm:-y}"
+    [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+  fi
+
+  # Append entry to BUNDLE.md's Agents section (right before "## Status (live)").
+  bundle_md="${path}/BUNDLE.md"
+  if [ -f "$bundle_md" ]; then
+    today="$(date +%Y-%m-%d)"
+    entry=$'\n### '"${name}"$'\n''- **Role:** '"${role}"$'\n''- **Status:** running (since '"${today}"$')\n''- **Task:** '"${description//$'\n'/ }"$'\n''- **Session:** `'"${name}"$'`'
+    awk -v entry="$entry" '
+      /^## Status \(live\)/ && !done { print entry; print ""; done = 1 }
+      { print }
+      END { if (!done) print entry }
+    ' "$bundle_md" > "${bundle_md}.new" && mv "${bundle_md}.new" "$bundle_md"
+  fi
+
+  # Generate session UUID and persist name|role|uuid for restart-resume.
+  session_uuid="$(uuidgen)"
+  printf '%s|%s|%s\n' "$name" "$role" "$session_uuid" >> "${path}/.agents"
+
+  # Launch via recon. Pass args to the launcher script.
+  # Quote each arg for safe single-line shell parsing inside tmux.
+  q() { printf "%q" "$1"; }
+  cmd="./scripts/agent-launch $(q "$role") $(q "$name") $(q "$task_id") $(q "$session_uuid") $(q "$description")"
+
+  recon launch \
+    --name "$name" \
+    --cwd "$path" \
+    --tag "bundle:${task_id}" \
+    --tag "role:${role}" \
+    --tag "agent:${name}" \
+    --command "$cmd"
+
+  echo "Launched agent: $name (role=$role, task=$task_id)"
+  echo "Initial task delivered as a [MESSAGE] from Orchestrator."
+  exit 0
+fi
+
+# --- agent list --------------------------------------------------------------
+
+if [[ "$action" == "list" ]]; then
+  filter="${1:-}"
+  if command -v python3 >/dev/null 2>&1 && command -v recon >/dev/null 2>&1; then
+    recon json 2>/dev/null | python3 -c "
+import json, sys
+try: data = json.load(sys.stdin)
+except: sys.exit(0)
+filter_b = '${filter}'
+rows = []
+for s in data.get('sessions', []):
+    tags = s.get('tags', [])
+    bundle = next((t.split(':',1)[1] for t in tags if t.startswith('bundle:')), '-')
+    role   = next((t.split(':',1)[1] for t in tags if t.startswith('role:')),   '-')
+    agent  = next((t.split(':',1)[1] for t in tags if t.startswith('agent:')),  '-')
+    if filter_b and bundle != filter_b: continue
+    rows.append((s.get('name','-'), bundle, role, agent))
+if not rows:
+    print('(no live agents)' if not filter_b else f'(no live agents for task: {filter_b})')
+else:
+    print(f'{\"AGENT-ID\":<28} {\"TASK\":<16} {\"ROLE\":<14} NAME')
+    for r in rows:
+        print(f'{r[0]:<28} {r[1]:<16} {r[2]:<14} {r[3]}')
+"
+  else
+    tmux list-sessions -F '#{session_name}' 2>/dev/null | \
+      { [ -n "${filter:-}" ] && grep "^${filter}-" || cat; } || echo "(no sessions)"
+  fi
+  exit 0
+fi
+
+# --- agent <id> kill | message ----------------------------------------------
+
+case "$action" in
+  kill)
+    # Find which task's .agents file (if any) currently tracks this agent.
+    task_path=""
+    for d in "$WT_DIR"/*/; do
+      if [ -f "${d}.agents" ] && grep -q "^${agent_id}|" "${d}.agents" 2>/dev/null; then
+        task_path="${d%/}"
+        break
+      fi
+    done
+
+    # Remove tracking entry first — the .agents file is the source of truth for
+    # "does this agent persist". If tmux is dead and .agents is empty too, the
+    # agent is fully deleted.
+    if [ -n "$task_path" ]; then
+      tmp_file="$(mktemp)"
+      grep -v "^${agent_id}|" "${task_path}/.agents" > "$tmp_file" || true
+      mv "$tmp_file" "${task_path}/.agents"
+      [ -s "${task_path}/.agents" ] || rm -f "${task_path}/.agents"
+    fi
+
+    # Kill the tmux session if it's still alive.
+    if tmux has-session -t "$agent_id" 2>/dev/null; then
+      tmux kill-session -t "$agent_id"
+      echo "Killed agent: $agent_id"
+    elif [ -n "$task_path" ]; then
+      echo "Removed dead agent from registry: $agent_id"
+    else
+      echo "Error: no agent '$agent_id' in any .agents file or tmux" >&2
+      exit 1
+    fi
+    ;;
+
+  message|msg)
+    text="$*"
+    [[ -z "$text" ]] && { echo "Usage: agent <id> message <text...>" >&2; exit 1; }
+
+    if ! tmux has-session -t "$agent_id" 2>/dev/null; then
+      echo "Error: no tmux session named '$agent_id'" >&2
+      exit 1
+    fi
+
+    if [ -n "${WT_AGENT_NAME:-}" ]; then
+      prefix="[MESSAGE] (From ${WT_AGENT_NAME} Agent)"
+    else
+      prefix="[MESSAGE] (From Human)"
+    fi
+
+    full_text="${prefix} ${text}"
+
+    # Robust delivery into Claude's TUI:
+    #   1. Use a tmux paste-buffer so special characters in $text (semicolons,
+    #      quotes, multi-byte chars, etc.) are inserted literally rather than
+    #      interpreted as tmux key names.
+    #   2. Brief sleep so the TUI ingests the text before we submit.
+    #   3. Send Enter as a separate key event to actually submit the message.
+    buf_name="claude_msg_$$"
+    printf '%s' "$full_text" | tmux load-buffer -b "$buf_name" -
+    tmux paste-buffer -b "$buf_name" -t "$agent_id" -p
+    tmux delete-buffer -b "$buf_name" 2>/dev/null || true
+    sleep 0.15
+    tmux send-keys -t "$agent_id" Enter
+    echo "Sent to $agent_id  (${#full_text} chars)"
+    ;;
+
+  resume)
+    # Find the .agents entry across all tasks.
+    task_path=""
+    role=""
+    session_uuid=""
+    for d in "$WT_DIR"/*/; do
+      if [ -f "${d}.agents" ]; then
+        line="$(grep "^${agent_id}|" "${d}.agents" 2>/dev/null || true)"
+        if [ -n "$line" ]; then
+          task_path="${d%/}"
+          role="$(echo "$line" | cut -d'|' -f2)"
+          session_uuid="$(echo "$line" | cut -d'|' -f3)"
+          break
+        fi
+      fi
+    done
+
+    if [ -z "$task_path" ]; then
+      echo "Error: no agent '$agent_id' in any .agents file. Nothing to resume." >&2
+      exit 1
+    fi
+
+    if tmux has-session -t "$agent_id" 2>/dev/null; then
+      echo "Agent '$agent_id' is already alive in tmux. Nothing to do."
+      exit 0
+    fi
+
+    if ! command -v recon >/dev/null 2>&1; then
+      echo "Error: 'recon' not on PATH. Run '. ~/.cargo/env' first." >&2
+      exit 1
+    fi
+
+    task_id="$(basename "$task_path")"
+
+    # Pick the right launcher + args by role.
+    if [ "$role" = "orchestrator" ]; then
+      cmd="./scripts/task-launch-orchestrator --resume $(printf %q "$session_uuid")"
+    else
+      cmd="./scripts/agent-launch --resume $(printf %q "$agent_id") $(printf %q "$task_id") $(printf %q "$session_uuid")"
+    fi
+
+    recon launch \
+      --name "$agent_id" \
+      --cwd "$task_path" \
+      --tag "bundle:${task_id}" \
+      --tag "role:${role}" \
+      --tag "agent:${agent_id}" \
+      --command "$cmd"
+
+    echo "Resumed agent: $agent_id (task=$task_id, role=$role)"
+    ;;
+
+  *)
+    echo "Unknown action: $action" >&2
+    echo "Usage: agent <id> {kill|resume|message <text>}" >&2
+    exit 1
+    ;;
+esac

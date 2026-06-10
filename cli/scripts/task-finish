@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+# task-finish - close out a task: review, merge to main, archive, clean up.
+#
+# Invoked by `task <id> finish [--no-review] [--no-ff]`.
+#   --no-review  Skip the automated code review step.
+#   --no-ff      Use a no-fast-forward merge commit instead of squash (default: squash).
+#
+# Phases:
+#   1. Pre-flight: validate task, show summary, first confirmation.
+#   2. Handle uncommitted changes (other than BUNDLE.md).
+#   3. Review changes via headless Claude (sonnet). Save to docs/wt-history/.
+#   4. Second confirmation (merge?).
+#   5. Archive BUNDLE.md → docs/wt-history/<task>.md, commit.
+#   6. Generate commit message from BUNDLE.md + diff via haiku.
+#   7. Merge to main (handle conflicts gracefully).
+#   8. Clean up: kill tmux sessions for this task, remove worktree, delete branch.
+
+set -euo pipefail
+
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+
+bundle="${1:-}"
+[[ -z "$bundle" ]] && {
+  echo "Usage: task <id> finish [--no-review] [--no-ff]" >&2
+  exit 1
+}
+shift
+
+do_review=1
+merge_strategy="squash"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-review) do_review=0 ;;
+    --no-ff)     merge_strategy="no-ff" ;;
+    --squash)    merge_strategy="squash" ;;
+    *) echo "Unknown flag: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+# Resolve the main repo root, even if invoked from inside a worktree.
+this_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "Error: not in a git repository" >&2
+  exit 1
+}
+if [[ "$this_root" == */.worktrees/* ]]; then
+  REPO_ROOT="${this_root%/.worktrees/*}"
+else
+  REPO_ROOT="$this_root"
+fi
+path="${REPO_ROOT}/.worktrees/${bundle}"
+branch="wt/${bundle}"
+
+# --- 1. Pre-flight -----------------------------------------------------------
+
+[ ! -d "$path" ] && { echo "Error: no worktree at $path" >&2; exit 1; }
+git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${branch}" || {
+  echo "Error: branch ${branch} does not exist" >&2; exit 1;
+}
+
+# Uncommitted excluding BUNDLE.md (which we archive ourselves).
+uncommitted="$(git -C "$path" status --porcelain | grep -v ' BUNDLE.md$' | grep -v '^?? BUNDLE.md$' || true)"
+commits_ahead="$(git -C "$path" rev-list --count main..HEAD 2>/dev/null || echo "?")"
+files_changed="$(git -C "$path" diff --name-only main..HEAD 2>/dev/null | wc -l)"
+
+echo "── Bundle: $bundle ────────────────────────────"
+echo "  Branch:        $branch"
+echo "  Worktree:      $path"
+echo "  Ahead of main: $commits_ahead commit(s)"
+echo "  Files changed: $files_changed (vs main)"
+if [[ -n "$uncommitted" ]]; then
+  echo "  Uncommitted:   $(echo "$uncommitted" | wc -l) file(s) (excluding BUNDLE.md)"
+else
+  echo "  Uncommitted:   none"
+fi
+echo "  Merge mode:    $merge_strategy"
+echo "  Review:        $([ $do_review -eq 1 ] && echo yes || echo skipped)"
+echo "────────────────────────────────────────────────"
+echo
+read -r -p "Mark this bundle as finished and proceed? [y/N] " confirm
+[[ ! "${confirm:-}" =~ ^[Yy]$ ]] && { echo "Aborted."; exit 0; }
+
+# --- 2. Handle uncommitted non-BUNDLE.md changes -----------------------------
+
+if [[ -n "$uncommitted" ]]; then
+  echo
+  echo "Uncommitted changes in bundle worktree:"
+  git -C "$path" status --short | grep -v 'BUNDLE.md' || true
+  echo
+  echo "  c - Commit them now (auto-message via haiku)"
+  echo "  s - Skip (changes will be DROPPED when worktree is removed)"
+  echo "  a - Abort"
+  read -r -p "Choice [c/s/a]: " choice
+  case "${choice:-a}" in
+    [Cc]*)
+      git -C "$path" add -A -- ':!BUNDLE.md'
+      msg_prompt="Write a short commit message for these uncommitted changes:
+
+$(git -C "$path" diff --cached --stat)
+
+Format: imperative summary on line 1 (<72 chars). Output ONLY the message."
+      msg="$(claude -p --model haiku --output-format text --no-session-persistence --disable-slash-commands "$msg_prompt" 2>/dev/null || echo "wt: commit pre-finish changes for ${bundle}")"
+      msg="${msg:-wt: commit pre-finish changes for ${bundle}}"
+      git -C "$path" commit -m "$msg"
+      echo "Committed: $msg"
+      ;;
+    [Ss]*)
+      echo "Warning: uncommitted changes will be dropped."
+      ;;
+    *)
+      echo "Aborted."; exit 0 ;;
+  esac
+fi
+
+# --- 3. Review ---------------------------------------------------------------
+
+mkdir -p "${path}/docs/wt-history"
+
+if [[ $do_review -eq 1 ]]; then
+  echo
+  echo "Running review (sonnet)... this may take a moment."
+
+  bundle_md="$(cat "${path}/BUNDLE.md" 2>/dev/null || echo "(no BUNDLE.md)")"
+  files_list="$(git -C "$path" diff --name-only main..HEAD)"
+  diff_text="$(git -C "$path" diff main..HEAD)"
+  # Cap at ~80KB so we don't blow context on big bundles.
+  if [[ ${#diff_text} -gt 81920 ]]; then
+    diff_text="${diff_text:0:81920}
+
+[...diff truncated at 80KB. Run \`git -C $path diff main..HEAD\` to see the full diff.]"
+  fi
+
+  read -r -d '' review_prompt <<PROMPT || true
+You are doing a final pre-merge review on a feature branch ("bundle"). Be thorough but don't manufacture issues. The user trusts this review — if something's actually fine, say so.
+
+The bundle's stated intent (from BUNDLE.md):
+${bundle_md}
+
+Files changed:
+${files_list}
+
+Full diff (vs main):
+${diff_text}
+
+Produce a markdown review with exactly these sections, in this order:
+
+## Verdict
+One sentence: "clear to merge", "merge with minor fixes", or "do not merge yet". Plus one short clause why.
+
+## Critical issues
+Anything that would break production, leak secrets, or cause data loss. Write "none" if there are none.
+
+## Security
+Auth gaps, injection risks, secret/token exposure, OWASP-relevant concerns. Write "none" if there are none.
+
+## Bugs
+Logic errors, off-by-one, error-handling gaps, race conditions, missing null/empty checks, type mismatches. Write "none" if there are none.
+
+## Scope drift
+Changes in the diff that don't match the bundle's stated Purpose or Scope & Bounds in BUNDLE.md. Write "none" if there are none.
+
+## Suggestions (non-blocking)
+Code quality, readability, minor cleanups. Keep this short. Skip entirely if nothing to say.
+
+For each issue list \`file:line\`, what's wrong, and a one-line suggested fix. Output ONLY the markdown, no surrounding commentary.
+PROMPT
+
+  review_file="${path}/docs/wt-history/${bundle}-review.md"
+  if claude -p \
+      --model sonnet \
+      --output-format text \
+      --no-session-persistence \
+      --disable-slash-commands \
+      "$review_prompt" > "$review_file" 2>/dev/null && [ -s "$review_file" ]; then
+    echo
+    echo "── Review ──────────────────────────────────────"
+    cat "$review_file"
+    echo "────────────────────────────────────────────────"
+    echo
+    echo "Full review saved to: docs/wt-history/${bundle}-review.md"
+  else
+    echo "Warning: review call failed or returned empty output."
+    rm -f "$review_file"
+  fi
+
+  echo
+  read -r -p "Proceed with merge to main? [y/N] " merge_confirm
+  [[ ! "${merge_confirm:-}" =~ ^[Yy]$ ]] && {
+    echo "Aborted. Bundle still at $path. Review (if any) saved.";
+    exit 0;
+  }
+fi
+
+# --- 4. Archive BUNDLE.md → docs/wt-history/<bundle>.md ----------------------
+
+archive_path="${path}/docs/wt-history/${bundle}.md"
+if [ -f "${path}/BUNDLE.md" ]; then
+  echo
+  echo "Archiving BUNDLE.md → docs/wt-history/${bundle}.md"
+  closed_date="$(date +%Y-%m-%d)"
+  awk -v date="$closed_date" '
+    NR == 1 { print; print ""; print "> **Closed:** " date; next }
+    { print }
+  ' "${path}/BUNDLE.md" > "$archive_path"
+
+  # Stage: handle both tracked and untracked BUNDLE.md cases.
+  if git -C "$path" ls-files --error-unmatch BUNDLE.md >/dev/null 2>&1; then
+    git -C "$path" rm BUNDLE.md
+  else
+    rm "${path}/BUNDLE.md"
+  fi
+  git -C "$path" add "docs/wt-history/${bundle}.md"
+  [ -f "${path}/docs/wt-history/${bundle}-review.md" ] && \
+    git -C "$path" add "docs/wt-history/${bundle}-review.md"
+  git -C "$path" commit -m "wt: archive bundle ${bundle} on close"
+else
+  echo "Note: no BUNDLE.md to archive (already moved or never created)."
+fi
+
+# --- 5. Generate commit message ----------------------------------------------
+
+echo
+echo "Generating commit message (haiku)..."
+
+bundle_md_archived="$(cat "$archive_path" 2>/dev/null || echo "(no archive)")"
+diff_stat="$(git -C "$path" diff --stat main..HEAD)"
+files_list="$(git -C "$path" diff --name-only main..HEAD)"
+
+read -r -d '' msg_prompt <<PROMPT || true
+Write a clean commit message for a squash-merge of a feature branch.
+
+Bundle: ${bundle}
+Archived BUNDLE.md (intent / scope):
+${bundle_md_archived}
+
+Files changed:
+${files_list}
+
+Diff stat:
+${diff_stat}
+
+Format:
+- Line 1: imperative summary, under 72 chars (e.g. "Add Google OAuth flow").
+- Blank line.
+- 2-5 bullet points describing what was done and why. Reference key files when meaningful.
+- No trailing trailers, no "Generated with" attribution, no co-author lines.
+
+Output ONLY the message text.
+PROMPT
+
+commit_msg_file="$(mktemp)"
+if claude -p --model haiku --output-format text --no-session-persistence --disable-slash-commands \
+    "$msg_prompt" > "$commit_msg_file" 2>/dev/null && [ -s "$commit_msg_file" ]; then
+  echo
+  echo "── Generated commit message ──────────"
+  cat "$commit_msg_file"
+  echo "──────────────────────────────────────"
+  read -r -p "Use this message? [Y/e=edit/a=abort] " msg_choice
+  case "${msg_choice:-y}" in
+    [Ee]*) ${EDITOR:-vi} "$commit_msg_file" ;;
+    [Aa]*) echo "Aborted."; rm -f "$commit_msg_file"; exit 0 ;;
+    *) ;;
+  esac
+else
+  echo "Warning: haiku call failed. Using fallback message."
+  printf 'Merge bundle %s into main\n' "$bundle" > "$commit_msg_file"
+fi
+
+# --- 6. Merge to main --------------------------------------------------------
+
+# Main's worktree must be clean.
+main_dirty="$(git -C "$REPO_ROOT" status --porcelain)"
+if [[ -n "$main_dirty" ]]; then
+  echo "Error: main worktree at $REPO_ROOT has uncommitted changes:" >&2
+  git -C "$REPO_ROOT" status --short >&2
+  echo "Commit or stash them before finishing a bundle." >&2
+  rm -f "$commit_msg_file"
+  exit 1
+fi
+
+main_branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
+if [[ "$main_branch" != "main" ]]; then
+  echo "Note: main worktree is on '$main_branch', switching to main for merge."
+  git -C "$REPO_ROOT" checkout main
+fi
+
+echo
+echo "Merging $branch into main (strategy: $merge_strategy)..."
+merge_ok=1
+if [[ "$merge_strategy" == "squash" ]]; then
+  if git -C "$REPO_ROOT" merge --squash "$branch"; then
+    git -C "$REPO_ROOT" commit -F "$commit_msg_file" || merge_ok=0
+  else
+    merge_ok=0
+  fi
+else
+  git -C "$REPO_ROOT" merge --no-ff "$branch" -F "$commit_msg_file" || merge_ok=0
+fi
+
+rm -f "$commit_msg_file"
+
+if [[ $merge_ok -eq 0 ]]; then
+  echo
+  echo "Error: merge conflict. Conflicting files:" >&2
+  git -C "$REPO_ROOT" diff --name-only --diff-filter=U >&2
+  echo
+  echo "Recovery steps:" >&2
+  echo "  1. (Already happened) The failed merge is aborted by git; main is unchanged." >&2
+  echo "  2. Pull main into the bundle to resolve there:" >&2
+  echo "       git -C $path merge main" >&2
+  echo "  3. Resolve conflicts in the bundle worktree, commit." >&2
+  echo "  4. Re-run: task $bundle finish" >&2
+  git -C "$REPO_ROOT" merge --abort 2>/dev/null || true
+  exit 1
+fi
+
+echo "Merge succeeded."
+
+# --- 7. Cleanup --------------------------------------------------------------
+
+echo
+echo "Cleaning up..."
+
+# Kill tmux sessions for this bundle. Prefer querying recon by tag; fall back to name pattern.
+killed=()
+if command -v recon >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  while read -r s; do
+    [[ -z "$s" ]] && continue
+    if tmux kill-session -t "$s" 2>/dev/null; then killed+=("$s"); fi
+  done < <(recon json 2>/dev/null | python3 -c "
+import json, sys
+try: data = json.load(sys.stdin)
+except: sys.exit(0)
+for s in data.get('sessions', []):
+    if 'bundle:${bundle}' in s.get('tags', []):
+        print(s.get('name', ''))
+" 2>/dev/null)
+fi
+if [ ${#killed[@]} -eq 0 ] && command -v tmux >/dev/null 2>&1; then
+  while read -r s; do
+    [[ -z "$s" ]] && continue
+    if [[ "$s" =~ ^${bundle}-[A-Za-z][A-Za-z0-9_-]*$ ]]; then
+      tmux kill-session -t "$s" 2>/dev/null && killed+=("$s")
+    fi
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+fi
+if [ ${#killed[@]} -gt 0 ]; then
+  printf '  Killed tmux session: %s\n' "${killed[@]}"
+else
+  echo "  No tmux sessions for this bundle (none were running)."
+fi
+
+# Remove worktree.
+git -C "$REPO_ROOT" worktree remove "$path" --force
+echo "  Removed worktree: $path"
+
+# Delete branch. -d fails on squash because git doesn't see it as merged; -D is safe here
+# because we just successfully merged its content.
+if git -C "$REPO_ROOT" branch -d "$branch" 2>/dev/null; then
+  echo "  Deleted branch: $branch"
+else
+  git -C "$REPO_ROOT" branch -D "$branch"
+  echo "  Force-deleted branch: $branch (squash merge doesn't update merge tracking)"
+fi
+
+# --- Done --------------------------------------------------------------------
+
+echo
+echo "Bundle '$bundle' finished and merged to main."
+echo "  Archive: docs/wt-history/${bundle}.md"
+[ -f "${REPO_ROOT}/docs/wt-history/${bundle}-review.md" ] && \
+  echo "  Review:  docs/wt-history/${bundle}-review.md"

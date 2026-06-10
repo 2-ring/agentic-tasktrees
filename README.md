@@ -1,8 +1,8 @@
 # Agentic TaskTrees
 
-A VSCode sidebar for running **multi-agent coding workflows** across **isolated git worktrees**, with **auto-managed dev servers** and a **clean, configurable UI**. Pairs with [`task-manager`](https://github.com/2-ring/task-manager) (the `task` / `agent` / `recon` CLIs) to give you a full visual control surface for parallel Claude Code sessions.
+A VSCode sidebar for running **multi-agent coding workflows** across **isolated git worktrees**, with **auto-managed dev servers** and a **clean, configurable UI** — a full visual control surface for parallel Claude Code sessions. The CLI it drives ships in this repo under [`cli/`](cli/); the only external dependency is [`recon`](https://github.com/gavraz/recon) for tmux session tracking.
 
-![sidebar](https://github.com/2-ring/agentic-tasktrees/assets/placeholder/sidebar.png)
+![Agentic TaskTrees sidebar](docs/sidebar.png)
 
 ---
 
@@ -155,9 +155,9 @@ The extension shells out to three CLIs:
 | `agenticTaskTrees.commands.task`       | `task`  | `task new`, `task <id> kill`, `task <id> finish`             |
 | `agenticTaskTrees.commands.agent`      | `agent` | `agent new --task <t> <n> <r> <d>`, `agent <id> resume`, `agent <id> kill` |
 
-Reference implementations live in [`task-manager`](https://github.com/2-ring/task-manager) (a fork of [`gavraz/recon`](https://github.com/gavraz/recon) with `task` and `agent` Bash scripts layered on top). You can substitute your own implementations as long as they honor the same subcommand surface.
+`task` and `agent` (plus the per-task launcher scripts they invoke) ship in this repo under [`cli/`](cli/) — see [`cli/README.md`](cli/README.md) for the install steps. They're plain Bash; you can substitute your own implementations as long as they honor the same subcommand surface.
 
-You also need `tmux` and a Claude Code (or compatible) CLI inside each agent's session.
+The only external dependency is [`recon`](https://github.com/gavraz/recon), a tmux-native session dashboard (`cargo install` it). You also need `tmux` and a [Claude Code](https://claude.ai/code) (or compatible) CLI inside each agent's session.
 
 ---
 
@@ -172,6 +172,8 @@ code --install-extension agentic-tasktrees-*.vsix
 ```
 
 Then reload VSCode. Open the Explorer pane — you'll see **AGENTIC TASKTREES** at the bottom.
+
+Install the CLI it drives by following [`cli/README.md`](cli/README.md): put `cli/bin/{task,agent}` on your `PATH`, drop `cli/scripts/*` + `cli/templates/bundle.md` into the project you want to manage, and `cargo install` [`recon`](https://github.com/gavraz/recon).
 
 ---
 

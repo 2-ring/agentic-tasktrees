@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# task - parallel-agent worktree controller.
+#
+# Subcommands:
+#   task new                              Interactive: prompts for name + description
+#   task new <name>                       Prompts for description only
+#   task new <name> <description>         Non-interactive (one-line; orchestrator-friendly)
+#   task list                             List active tasks
+#   task <id> kill                        Kill all agents for this task (worktree kept)
+#   task <id> resume                      Restart this task's agents (after reboot) using their stored session IDs
+#   task <id> finish                      Review, merge to main, archive BUNDLE.md, clean up
+#   task help                             Show this help
+#
+# Each task is one git worktree with its own BUNDLE.md, branch, and agent
+# sessions. The orchestrator (`<task>-orch`) is launched automatically by
+# `task new`. Sub-agents are added via `agent new`.
+
+set -euo pipefail
+
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "Error: not in a git repository" >&2
+  exit 1
+}
+# If invoked from inside a worktree, REPO_ROOT points to the worktree. Resolve up.
+if [[ "$REPO_ROOT" == */.worktrees/* ]]; then
+  REPO_ROOT="${REPO_ROOT%/.worktrees/*}"
+fi
+
+WT_DIR="${REPO_ROOT}/.worktrees"
+TEMPLATE_PATH="${REPO_ROOT}/.claude/templates/bundle.md"
+ORCH_LAUNCHER="./scripts/task-launch-orchestrator"
+
+# Env files to copy from the main repo into each new worktree (relative paths).
+# Worktrees don't inherit gitignored files like .env, so list the ones your
+# dev servers need here. Empty by default — set TASK_ENV_FILES to a
+# space-separated list to override, e.g.:
+#   export TASK_ENV_FILES="backend/.env web/.env"
+read -r -a ENV_FILES <<< "${TASK_ENV_FILES:-}"
+
+# --- Subcommand dispatch -----------------------------------------------------
+# Forms:
+#   task new ...
+#   task list
+#   task help / -h / --help / (no args)
+#   task <id> kill | finish
+
+first="${1:-help}"
+shift || true
+
+case "$first" in
+  new)         action="new" ;;
+  list)        action="list" ;;
+  help|-h|--help|"") action="help" ;;
+  *)
+    # First arg is a task id. Second arg is the action.
+    task_id="$first"
+    action="${1:-}"
+    shift || true
+    if [[ -z "$action" ]]; then
+      echo "Usage: task <id> {kill|finish}" >&2
+      exit 1
+    fi
+    ;;
+esac
+
+# --- task new ----------------------------------------------------------------
+
+if [[ "$action" == "new" ]]; then
+  [ -f "$TEMPLATE_PATH" ] || {
+    echo "Error: BUNDLE.md template not found at $TEMPLATE_PATH" >&2
+    exit 1
+  }
+
+  # Optional --no-attach: skip the final `tmux attach` (useful when called
+  # from another TUI like task-menu — it doesn't want the orchestrator to
+  # take over the terminal).
+  no_attach=0
+  filtered=()
+  for arg in "$@"; do
+    if [[ "$arg" == "--no-attach" ]]; then
+      no_attach=1
+    else
+      filtered+=("$arg")
+    fi
+  done
+  set -- "${filtered[@]}"
+
+  # Args: $1 = name (optional), $2 = description (optional)
+  name="${1:-}"
+  description="${2:-}"
+  non_interactive=0
+  [[ -n "$name" && -n "$description" ]] && non_interactive=1
+
+  # Prompt for name if not given.
+  if [[ -z "$name" ]]; then
+    read -r -p "Task name (kebab-case, e.g. google-auth): " name
+    [[ -z "${name:-}" ]] && { echo "Aborted."; exit 1; }
+  fi
+
+  if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "Error: use only lowercase letters, numbers, and dashes (must start with letter/number)" >&2
+    exit 1
+  fi
+
+  path="${WT_DIR}/${name}"
+  branch="wt/${name}"
+
+  [ -d "$path" ] && { echo "Error: task already exists at $path" >&2; exit 1; }
+  if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/${branch}"; then
+    echo "Error: branch ${branch} already exists" >&2
+    exit 1
+  fi
+
+  # Prompt for description if not given.
+  if [[ -z "$description" ]]; then
+    echo
+    echo "Describe what this task should do. Cover (in any order):"
+    echo "  - Purpose: what & why, and what 'done' looks like"
+    echo "  - Scope: where to focus edits / what is off-limits"
+    echo "  - Rules or context: flags, constraints, references"
+    echo "  - Plan: rough sub-tasks or sequence"
+    echo "  - Agents: who is working on this (default: one Orchestrator)"
+    echo
+    echo "End with Ctrl+D on its own line:"
+    description="$(cat)"
+  fi
+
+  # Confirmation (only if interactive).
+  if [[ $non_interactive -eq 0 ]]; then
+    echo
+    echo "── About to create ──────────────────────────────"
+    echo "  Task:        $name"
+    echo "  Path:        $path"
+    echo "  Branch:      $branch"
+    echo "  Description: $(echo "$description" | wc -l) lines, $(echo "$description" | wc -c) chars"
+    echo "─────────────────────────────────────────────────"
+    read -r -p "Proceed? [y/N] " confirm
+    [[ "${confirm:-}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+  fi
+
+  # 1. Worktree.
+  echo
+  echo "Creating worktree..."
+  mkdir -p "$WT_DIR"
+  git -C "$REPO_ROOT" worktree add "$path" -b "$branch"
+
+  # 2. Env files.
+  for env_path in "${ENV_FILES[@]}"; do
+    src="${REPO_ROOT}/${env_path}"
+    dst="${path}/${env_path}"
+    if [ -f "$src" ]; then
+      mkdir -p "$(dirname "$dst")"
+      cp "$src" "$dst"
+      echo "Copied ${env_path}"
+    fi
+  done
+
+  # 3. Skeleton BUNDLE.md.
+  sed -e "s/<TITLE>/${name}/g" \
+      -e "s/<DATE>/$(date +%Y-%m-%d)/g" \
+      "$TEMPLATE_PATH" > "${path}/BUNDLE.md"
+
+  # 4. Headless opus 4.6 to flesh out BUNDLE.md.
+  if [ -n "$description" ]; then
+    echo
+    echo "Calling headless Claude (opus 4.6) to flesh out BUNDLE.md from your description..."
+
+    read -r -d '' prompt <<PROMPT || true
+You are filling out a BUNDLE.md for a parallel-agent worktree.
+
+Below is a skeleton template and the user's free-form description of what this task should do. Rewrite the skeleton, replacing every "(fill in)" placeholder with concrete content derived from the description.
+
+Rules — follow these exactly:
+1. Preserve the exact section structure: every '# Heading', every '## Heading', every '### Heading', and every '> blockquote subheading' must remain in place and unchanged.
+2. The blockquote subheadings ('> ...') are instructions for HUMANS, not content to expand. Leave them verbatim.
+3. Replace "(fill in)" placeholders with specific content from the description. Be concrete. Use bullet lists, paths, and concrete language where possible.
+4. Where the description doesn't supply enough detail for a section, write "(TBD: <specific question the user should answer>)" so they know what's missing. Do NOT invent details.
+5. The "Status (live)" section stays as the skeleton wrote it ("State: not started", etc.) — work hasn't started yet.
+6. If the description mentions specific agents, list them under "## Agents" with their roles/tasks/goals. Otherwise keep just the Orchestrator entry.
+7. Output ONLY the final markdown content. No commentary before or after, no code fences around the output.
+
+8. The skeleton begins with YAML frontmatter:
+       ---
+       icon: folder
+       ---
+   Replace the icon value with the SINGLE most appropriate name from this list, based on the task's purpose. Output just the name on its own (no quotes, no comments):
+       - rocket    — new features, big launches, ambitious work
+       - bug       — bug fixes
+       - gear      — refactoring, infrastructure, config
+       - shield    — security, auth, permissions
+       - database  — data work, migrations, schemas
+       - beaker    — experiments, prototypes, spikes
+       - zap       — performance, speed
+       - book      — documentation, writing
+       - key       — secrets, credentials, encryption
+       - tools     — general fixes, maintenance, dev tooling
+       - mail      — notifications, comms, email/SMS
+       - globe     — web, networking, i18n
+   Pick the one that best matches the dominant theme of the task. Default to "tools" if nothing fits cleanly.
+
+--- SKELETON ---
+$(cat "${path}/BUNDLE.md")
+--- END SKELETON ---
+
+--- USER DESCRIPTION ---
+${description}
+--- END USER DESCRIPTION ---
+PROMPT
+
+    tmp_out="$(mktemp)"
+    if claude -p \
+        --model claude-opus-4-6 \
+        --output-format text \
+        --no-session-persistence \
+        --disable-slash-commands \
+        "$prompt" > "$tmp_out" 2>/dev/null && [ -s "$tmp_out" ]; then
+      cp "$tmp_out" "${path}/BUNDLE.md"
+      echo "BUNDLE.md filled in."
+    else
+      echo "Warning: headless Claude call failed or returned empty output."
+      echo "Skeleton BUNDLE.md left in place — edit manually."
+    fi
+    rm -f "$tmp_out"
+  fi
+
+  echo
+  echo "Task ready at: $path"
+
+  # 5. Launch orchestrator and auto-attach.
+  echo "Launching orchestrator and attaching..."
+
+  if ! command -v recon >/dev/null 2>&1; then
+    echo "Error: 'recon' not on PATH. Run '. ~/.cargo/env' first." >&2
+    exit 1
+  fi
+  if [ ! -x "${path}/scripts/task-launch-orchestrator" ]; then
+    echo "Error: orchestrator launcher missing at ${path}/scripts/task-launch-orchestrator" >&2
+    exit 1
+  fi
+
+  orch_session="${name}-orch"
+  orch_uuid="$(uuidgen)"
+
+  # Persist name|role|uuid so we can resume the orchestrator after reboot.
+  # File lives inside the worktree so it follows the task's lifecycle.
+  printf '%s|%s|%s\n' "$orch_session" "orchestrator" "$orch_uuid" >> "${path}/.agents"
+
+  recon launch \
+    --name "$orch_session" \
+    --cwd "$path" \
+    --tag "bundle:${name}" \
+    --tag "role:orchestrator" \
+    --tag "agent:Orchestrator" \
+    --command "$ORCH_LAUNCHER $orch_uuid"
+
+  if [[ $no_attach -eq 1 ]]; then
+    echo "Task '${name}' created. Orchestrator running in tmux session '${orch_session}'."
+    echo "  Re-attach:    tmux a -t ${orch_session}"
+    echo "  Message it:   agent ${orch_session} message '<text>'"
+    exit 0
+  fi
+
+  sleep 0.3
+  echo "(Detach when ready: Ctrl+b then d)"
+  sleep 0.5
+
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "$orch_session"
+  else
+    tmux attach -t "$orch_session"
+  fi
+
+  echo
+  echo "Detached. The orchestrator is still running."
+  echo "  Re-attach:    tmux a -t ${orch_session}"
+  echo "  Message it:   agent ${orch_session} message '<text>'"
+  echo "  Add agent:    agent new --task ${name} <name> <role> '<description>'"
+  echo "  Finish:       task ${name} finish"
+  exit 0
+fi
+
+# --- task list ---------------------------------------------------------------
+
+if [[ "$action" == "list" ]]; then
+  git -C "$REPO_ROOT" worktree list
+  exit 0
+fi
+
+# --- task help ---------------------------------------------------------------
+
+if [[ "$action" == "help" ]]; then
+  sed -n '2,15p' "$0"
+  exit 0
+fi
+
+# --- task <id> kill | finish -------------------------------------------------
+
+# At this point, $task_id is set and $action is whatever came after.
+path="${WT_DIR}/${task_id}"
+
+case "$action" in
+  finish)
+    exec "${REPO_ROOT}/scripts/task-finish" "$task_id" "$@"
+    ;;
+
+  kill)
+    # Kill all tmux sessions tagged bundle:<task_id> — worktree and branch stay.
+    [ -d "$path" ] || echo "Note: no worktree at $path (killing any matching sessions anyway)." >&2
+
+    killed=()
+    if command -v python3 >/dev/null 2>&1; then
+      while read -r s; do
+        [[ -z "$s" ]] && continue
+        if tmux kill-session -t "$s" 2>/dev/null; then killed+=("$s"); fi
+      done < <(recon json 2>/dev/null | python3 -c "
+import json, sys
+try: data = json.load(sys.stdin)
+except: sys.exit(0)
+for s in data.get('sessions', []):
+    if 'bundle:${task_id}' in s.get('tags', []):
+        print(s.get('name', ''))
+" 2>/dev/null)
+    fi
+    if [ ${#killed[@]} -eq 0 ]; then
+      while read -r s; do
+        [[ -z "$s" ]] && continue
+        if [[ "$s" =~ ^${task_id}- ]]; then
+          tmux kill-session -t "$s" 2>/dev/null && killed+=("$s")
+        fi
+      done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    fi
+
+    if [ ${#killed[@]} -gt 0 ]; then
+      printf 'Killed: %s\n' "${killed[@]}"
+    else
+      echo "No live sessions for task '$task_id'."
+    fi
+    echo "(Worktree at $path is unchanged. Use 'task $task_id finish' to merge & clean up.)"
+    ;;
+
+  resume)
+    agents_file="${path}/.agents"
+    if [ ! -f "$agents_file" ]; then
+      echo "No .agents file at $agents_file — nothing to resume."
+      exit 0
+    fi
+
+    resumed=0
+    skipped=0
+    while IFS='|' read -r name role uuid; do
+      [ -z "$name" ] && continue
+      if tmux has-session -t "$name" 2>/dev/null; then
+        skipped=$((skipped + 1))
+        continue
+      fi
+      "${REPO_ROOT}/scripts/agent" "$name" resume || true
+      resumed=$((resumed + 1))
+    done < "$agents_file"
+
+    echo "Task '$task_id': resumed $resumed, skipped $skipped (already alive)."
+    ;;
+
+  *)
+    echo "Unknown action: $action" >&2
+    echo "Usage: task <id> {kill|resume|finish}" >&2
+    exit 1
+    ;;
+esac
